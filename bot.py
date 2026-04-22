@@ -8,9 +8,9 @@ Features:
     FAST  (15m) - quick moves
 - 50 coins monitored:
     30 top coins (first 30 from supported list)
-    20 trending (biggest 24h price movers from Binance)
+    20 SMALL-CAP coins with high volume (filtered to only CoinGlass-supported, clean symbols)
 - 4-signal confluence (min 3/4 to alert)
-- Binance liquidation zones used for smart SL/TP when available
+- TREND FILTER: only LONG in uptrend, SHORT in downtrend (EMA 50)
 - Prices shown in USD + INR
 
 Trade manually on CoinSwitch.
@@ -164,9 +164,31 @@ def get_stable_coins(n):
     return []
 
 
-def get_trending_from_binance(n, exclude=None):
-    """Get biggest 24h movers (absolute % change) from Binance futures."""
-    exclude = set(s + "USDT" for s in (exclude or []))
+def get_all_coinglass_coins():
+    """Returns full list of ALL coins CoinGlass supports (for filtering)."""
+    try:
+        r = requests.get(
+            f"{CG_BASE}/api/futures/supported-coins",
+            headers=cg_headers(),
+            timeout=15,
+        )
+        data = r.json().get("data", [])
+        if isinstance(data, list):
+            return set(data)
+    except Exception as e:
+        log(f"[ERR] all CG coins: {e}")
+    return set()
+
+
+def get_smallcap_trending(n, top_coins_to_skip, coinglass_set):
+    """
+    Pick small-cap coins with high 24h volume that exist on CoinGlass.
+    - Skip the top 30 big coins (to get "small-cap")
+    - Require $20M+ daily volume (liquidity)
+    - Only include clean symbol names (alphanumeric)
+    - Only include coins on CoinGlass (so we have data)
+    """
+    exclude = set(s + "USDT" for s in (top_coins_to_skip or []))
     try:
         r = requests.get(
             f"{BINANCE_FUT_BASE}/fapi/v1/ticker/24hr",
@@ -176,26 +198,48 @@ def get_trending_from_binance(n, exclude=None):
             log(f"[ERR] binance ticker: {r.status_code}")
             return []
         data = r.json()
-        usdt = [
-            x for x in data
-            if x.get("symbol", "").endswith("USDT")
-            and x["symbol"] not in exclude
-            and float(x.get("quoteVolume", 0)) > 10_000_000  # at least $10M daily volume
-        ]
-        # sort by absolute % change - biggest movers (up OR down)
-        usdt.sort(key=lambda x: abs(float(x.get("priceChangePercent", 0))), reverse=True)
-        # strip "USDT" suffix so we get base symbols
-        return [x["symbol"][:-4] for x in usdt[:n]]
+
+        # Filter: valid USDT pairs, clean symbols, decent volume, on CoinGlass
+        candidates = []
+        for x in data:
+            sym = x.get("symbol", "")
+            if not sym.endswith("USDT"):
+                continue
+            if sym in exclude:
+                continue
+            # Only clean alphanumeric symbols (no Chinese chars, no weird names)
+            base = sym[:-4]
+            if not base.isalnum() or not base.isascii():
+                continue
+            # Skip leveraged tokens (UP/DOWN/BULL/BEAR)
+            if any(base.endswith(x) for x in ("UP", "DOWN", "BULL", "BEAR")):
+                continue
+            # Only include if CoinGlass has data
+            if base not in coinglass_set:
+                continue
+            # Minimum $20M 24h volume (real liquidity)
+            vol = float(x.get("quoteVolume", 0))
+            if vol < 20_000_000:
+                continue
+            pct = abs(float(x.get("priceChangePercent", 0)))
+            candidates.append((base, vol, pct))
+
+        # Sort by 24h volume (highest volume = most active = best for trading)
+        candidates.sort(key=lambda x: x[1], reverse=True)
+        # Take top n by volume
+        return [c[0] for c in candidates[:n]]
     except Exception as e:
-        log(f"[ERR] trending: {e}")
+        log(f"[ERR] smallcap trending: {e}")
         return []
 
 
 def build_coin_list():
     """Returns list of (base_symbol, category) tuples."""
+    coinglass_set = get_all_coinglass_coins()
     stable = get_stable_coins(TOP_N_STABLE)
-    trending = get_trending_from_binance(TOP_N_TRENDING, exclude=stable)
-    coins = [(s, "STABLE") for s in stable] + [(t, "TRENDING") for t in trending]
+    # For trending, skip the top 50 (not just top 30) to get true small-cap feel
+    smallcap = get_smallcap_trending(TOP_N_TRENDING, top_coins_to_skip=list(coinglass_set)[:50], coinglass_set=coinglass_set)
+    coins = [(s, "STABLE") for s in stable] + [(t, "SMALLCAP") for t in smallcap]
     return coins
 
 
@@ -312,6 +356,40 @@ def get_price_usd(symbol_pair):
     return None
 
 
+def get_trend(symbol_pair, interval):
+    """
+    Determine trend using EMA 50 on the given interval.
+    Returns 'UP', 'DOWN', or None.
+    Uses Binance klines (free, no auth).
+    """
+    try:
+        r = requests.get(
+            f"{BINANCE_FUT_BASE}/fapi/v1/klines",
+            params={"symbol": symbol_pair, "interval": interval, "limit": 100},
+            timeout=15,
+        )
+        if r.status_code != 200:
+            return None
+        klines = r.json()
+        if len(klines) < 50:
+            return None
+        # kline[4] = close price
+        closes = [float(k[4]) for k in klines]
+        # Calculate EMA 50
+        ema_period = 50
+        k_factor = 2.0 / (ema_period + 1)
+        ema = sum(closes[:ema_period]) / ema_period  # start with SMA
+        for price in closes[ema_period:]:
+            ema = (price - ema) * k_factor + ema
+        current_price = closes[-1]
+        if current_price > ema:
+            return "UP"
+        else:
+            return "DOWN"
+    except Exception:
+        return None
+
+
 # ============ SIGNAL ENGINE ============
 def window_index(interval):
     """Dedup window (different per interval)."""
@@ -405,23 +483,30 @@ def format_alert(mode, direction, symbol, category, entry, sl, tp, confidence, d
     sl_pct = ((sl - entry) / entry) * 100
     tp_pct = ((tp - entry) / entry) * 100
     rr = abs(tp_pct / sl_pct) if sl_pct != 0 else 0
-    mode_tag = "SWING (4h)" if mode == "SWING" else "FAST (15m)"
-    cat_tag = "STABLE" if category == "STABLE" else "TRENDING"
-    details_text = "\n".join(details)
+    emoji = "🟢" if direction == "LONG" else "🔴"
+    mode_tag = "⏳ SWING (4h)" if mode == "SWING" else "⚡ FAST (15m)"
+    cat_emoji = "🏦" if category == "STABLE" else "🔥"
+    cat_tag = "STABLE" if category == "STABLE" else "SMALL-CAP"
+    # Convert ASCII markers in details to nicer emojis
+    pretty_details = []
+    for line in details:
+        line = line.replace("[v]", "✅").replace("[-]", "⚪")
+        pretty_details.append(line)
+    details_text = "\n".join(pretty_details)
 
     return (
-        f"<b>{direction} - {symbol}</b>  [{confidence}/4]\n"
-        f"<i>{mode_tag} | {cat_tag}</i>\n"
-        f"--------------------\n"
-        f"Entry: {format_price(entry)}\n"
-        f"SL:    {format_price(sl)}  ({sl_pct:+.2f}%)\n"
-        f"TP:    {format_price(tp)}  ({tp_pct:+.2f}%)\n"
-        f"R:R:   1 : {rr:.2f}\n"
-        f"--------------------\n"
+        f"{emoji} <b>{direction} — {symbol}</b>   [{confidence}/4]\n"
+        f"{mode_tag}  |  {cat_emoji} <i>{cat_tag}</i>\n"
+        f"━━━━━━━━━━━━━━━━━━━\n"
+        f"📍 <b>Entry:</b> {format_price(entry)}\n"
+        f"🛑 <b>SL:</b>    {format_price(sl)}  ({sl_pct:+.2f}%)\n"
+        f"🎯 <b>TP:</b>    {format_price(tp)}  ({tp_pct:+.2f}%)\n"
+        f"📊 <b>R:R:</b>   1 : {rr:.2f}\n"
+        f"━━━━━━━━━━━━━━━━━━━\n"
         f"{details_text}\n"
-        f"--------------------\n"
-        f"{datetime.now(IST).strftime('%Y-%m-%d %H:%M')} IST\n"
-        f"<i>Trade manually on CoinSwitch. Verify on chart first.</i>"
+        f"━━━━━━━━━━━━━━━━━━━\n"
+        f"🕐 {datetime.now(IST).strftime('%Y-%m-%d %H:%M')} IST\n\n"
+        f"<i>📱 Trade manually on CoinSwitch. Verify on chart first.</i>"
     )
 
 
@@ -453,6 +538,23 @@ def check_coin(base_symbol, category, mode):
 
     if not direction:
         return
+
+    # ===== TREND FILTER =====
+    # Only allow LONG in uptrend, SHORT in downtrend
+    # Saves API calls by only checking trend when we have a signal
+    trend = get_trend(pair, interval)
+    time.sleep(REQUEST_DELAY_SEC)
+    if trend is None:
+        log(f"  [{mode[0]}] {pair:14s} signal {direction} but trend unknown -> skip")
+        return
+    if direction == "LONG" and trend != "UP":
+        log(f"  [{mode[0]}] {pair:14s} LONG signal rejected: trend is DOWN")
+        return
+    if direction == "SHORT" and trend != "DOWN":
+        log(f"  [{mode[0]}] {pair:14s} SHORT signal rejected: trend is UP")
+        return
+    # Add trend confirmation to details
+    details.append(f"[v] Trend {trend} confirms {direction}")
 
     key = f"{pair}-{direction}-{mode}-{window_index(interval)}"
     if key in _alerted:
@@ -507,20 +609,26 @@ def run():
         return
 
     stable = [c for c, cat in coins if cat == "STABLE"]
-    trending = [c for c, cat in coins if cat == "TRENDING"]
+    smallcap = [c for c, cat in coins if cat == "SMALLCAP"]
     log(f"Stable coins ({len(stable)}): {', '.join(stable[:15])}...")
-    log(f"Trending coins ({len(trending)}): {', '.join(trending[:15])}...")
+    log(f"Small-cap coins ({len(smallcap)}): {', '.join(smallcap[:15])}...")
 
     send_telegram(
-        f"<b>Mixed Bot Started</b>\n"
-        f"Coins: {len(stable)} stable + {len(trending)} trending\n"
-        f"SWING (4h): every {SWING_SCAN_EVERY_SECS//60} min\n"
-        f"FAST (15m): every {FAST_SCAN_EVERY_SECS//60} min\n"
-        f"Min confluence: {MIN_CONFLUENCE}/4\n"
-        f"1 USD = Rs.{_usd_to_inr:.2f}\n"
-        f"SL/TP:\n"
-        f"- SWING: {SL_PCT_SWING}% / {TP_PCT_SWING}%\n"
-        f"- FAST: {SL_PCT_FAST}% / {TP_PCT_FAST}%"
+        f"🚀 <b>Crypto Signal Bot Started</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━\n"
+        f"📊 Coins: <b>{len(stable)}</b> stable + <b>{len(smallcap)}</b> small-cap\n"
+        f"⏳ SWING (4h): every {SWING_SCAN_EVERY_SECS//60} min\n"
+        f"⚡ FAST (15m): every {FAST_SCAN_EVERY_SECS//60} min\n"
+        f"🎯 Min confluence: <b>{MIN_CONFLUENCE}/4</b>\n"
+        f"📈 Trend filter: <b>ON</b> (EMA 50)\n"
+        f"💱 1 USD = Rs.{_usd_to_inr:.2f}\n"
+        f"━━━━━━━━━━━━━━━━━━━\n"
+        f"<b>SL / TP:</b>\n"
+        f"• SWING: {SL_PCT_SWING}% / {TP_PCT_SWING}%  (1:{TP_PCT_SWING/SL_PCT_SWING:.1f} RR)\n"
+        f"• FAST: {SL_PCT_FAST}% / {TP_PCT_FAST}%  (1:{TP_PCT_FAST/SL_PCT_FAST:.1f} RR)\n"
+        f"━━━━━━━━━━━━━━━━━━━\n"
+        f"<i>Alerts only when 3+ signals agree with trend. "
+        f"Trade manually on CoinSwitch.</i>"
     )
 
     last_swing = 0
@@ -530,9 +638,9 @@ def run():
     while True:
         now = time.time()
 
-        # refresh trending list every 30 min
+        # refresh small-cap list every 30 min
         if now - last_coin_refresh > 1800:
-            log("Refreshing trending coin list...")
+            log("Refreshing small-cap coin list...")
             new_coins = build_coin_list()
             if new_coins:
                 coins = new_coins
